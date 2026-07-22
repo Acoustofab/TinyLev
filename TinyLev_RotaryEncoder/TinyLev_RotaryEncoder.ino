@@ -20,9 +20,9 @@
 // we trust it (software debounce, since Timer0/millis is disabled)
 #define ENCODER_DEBOUNCE_LOOPS 3
 
-#define CLK 5
-#define DT 6
-#define SW 7
+#define CLK 2
+#define DT 3
+#define SW 4
 
 int counter = 0;
 int currentState;
@@ -84,7 +84,7 @@ void setup()
    pinMode(11, INPUT_PULLUP); //pin 11 (B3) is the sync in
    //please connect pin 10 to pin 11
 
-   for (int i = 5; i < 8; ++i){ //pin 5 (CLK), 6 (DT), 7 (SW) are the encoder inputs
+   for (int i = 2; i < 5; ++i){ //pin 2 (CLK), 3 (DT), 4 (SW) are the encoder inputs
     pinMode(i, INPUT_PULLUP); 
    }
 
@@ -108,11 +108,12 @@ void setup()
  byte* emittingPointer = &animation[frame][0];
  byte buttonsPort = 0;
 
- bool encoderPin[3]; // [0]=CLK (pin5), [1]=DT (pin6), [2]=SW (pin7)
+ bool encoderPin[3]; // [0]=CLK (pin2), [1]=DT (pin3), [2]=SW (pin4)
+ volatile bool unused;  // unused - only exists to preserve original per-division cycle timing (must stay volatile or the compiler will strip it)
  short buttonCounter = 0;
 
  // --- encoder state (persists across LOOP iterations) ---
- byte clkReadState   = (PIND & 0b00100000) != 0; // raw last-seen CLK level (pin5)
+ byte clkReadState   = (PIND & 0b00000100) ? 1 : 0; // raw last-seen CLK level (pin2)
  byte lastCLK         = clkReadState;                // last CONFIRMED/debounced CLK level
  byte clkDebounceCount = 0;
 
@@ -120,13 +121,13 @@ void setup()
     while(PINB & 0b00001000); //wait for pin 11 (B3) to go low 
     
     OUTPUT_WAVE(emittingPointer, 0); buttonsPort = PIND; WAIT_LIT();
-    OUTPUT_WAVE(emittingPointer, 1); encoderPin[0] = buttonsPort & 0b00100000; WAIT_MID(); // CLK (pin5) WAIT_MID();
-    OUTPUT_WAVE(emittingPointer, 2); encoderPin[1] = buttonsPort & 0b01000000; WAIT_MID(); // DT  (pin6) WAIT_MID();
-    OUTPUT_WAVE(emittingPointer, 3);  encoderPin[2] = buttonsPort & 0b10000000; WAIT_MID(); // SW  (pin7)WAIT_MID();
-    OUTPUT_WAVE(emittingPointer, 4); WAIT_LOT();
-    OUTPUT_WAVE(emittingPointer, 5); WAIT_LOT();
-    OUTPUT_WAVE(emittingPointer, 6); WAIT_LOT();
-    OUTPUT_WAVE(emittingPointer, 7); WAIT_LOT();
+    OUTPUT_WAVE(emittingPointer, 1); unused = (buttonsPort & 0b11111100) != 0b11111100; WAIT_MID();
+    OUTPUT_WAVE(emittingPointer, 2); encoderPin[0] = buttonsPort & 0b00000100; WAIT_MID(); // CLK (pin2)
+    OUTPUT_WAVE(emittingPointer, 3); encoderPin[1] = buttonsPort & 0b00001000; WAIT_MID(); // DT  (pin3)
+    OUTPUT_WAVE(emittingPointer, 4); encoderPin[2] = buttonsPort & 0b00010000; WAIT_MID(); // SW  (pin4)
+    OUTPUT_WAVE(emittingPointer, 5); unused = buttonsPort & 0b00100000; WAIT_MID();
+    OUTPUT_WAVE(emittingPointer, 6); unused = buttonsPort & 0b01000000; WAIT_MID();
+    OUTPUT_WAVE(emittingPointer, 7); unused = buttonsPort & 0b10000000; WAIT_MID();
     OUTPUT_WAVE(emittingPointer, 8); WAIT_LOT();
     OUTPUT_WAVE(emittingPointer, 9); WAIT_LOT();
     OUTPUT_WAVE(emittingPointer, 10); WAIT_LOT();
@@ -147,7 +148,7 @@ void setup()
 
     // --- ROTATION: debounce CLK over a few loop passes, then read DT at the edge ---
     {
-      byte curCLK = encoderPin[0] != 0;
+      byte curCLK = encoderPin[0];
 
       if (curCLK == clkReadState) {
         if (clkDebounceCount < 255) ++clkDebounceCount;
@@ -158,20 +159,20 @@ void setup()
 
       if (clkDebounceCount == ENCODER_DEBOUNCE_LOOPS && clkReadState != lastCLK) {
         if (clkReadState == 0) { // confirmed CLK falling edge -> one detent
-          byte curDT = encoderPin[1] != 0;
+          byte curDT = encoderPin[1];
           if (curDT != clkReadState) {
-            // DT HIGH while CLK LOW: clockwise
-            if ( frame >= N_FRAMES - STEP_SIZE ) {
-              frame = 0;
-            } else {
-              frame += STEP_SIZE;
-            }
-          } else {
-            // DT LOW while CLK LOW: counter-clockwise
+            // DT HIGH while CLK LOW: clockwise -> down
             if ( frame < STEP_SIZE ) {
               frame = N_FRAMES - 1;
             } else {
               frame -= STEP_SIZE;
+            }
+          } else {
+            // DT LOW while CLK LOW: counter-clockwise -> up
+            if ( frame >= N_FRAMES - STEP_SIZE ) {
+              frame = 0;
+            } else {
+              frame += STEP_SIZE;
             }
           }
           emittingPointer = &animation[frame][0];
