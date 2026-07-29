@@ -1,36 +1,99 @@
-#include <avr/sleep.h>
-#include <avr/power.h>
+/*
+  ESP32 port of the original AVR sketch
+  ======================================
+  WHY THINGS CHANGED (read this before flashing):
 
-#define N_PORTS 1
-#define N_DIVS 24
+  1. 40 kHz sync signal
+     The AVR version bit-banged Timer1 into fast-PWM mode by hand.
+     On ESP32 the equivalent -- and far more precise -- approach is the
+     LEDC peripheral: a hardware clock divider drives the pin directly,
+     so the frequency is rock solid and completely independent of what
+     the CPU/RTOS/WiFi stack is doing. That's what PIN_SYNC_OUT below
+     uses.
 
-#define WAIT_LOT(a) __asm__ __volatile__ ("nop"); __asm__ __volatile__ ("nop"); __asm__ __volatile__ ("nop");  __asm__ __volatile__ ("nop"); __asm__ __volatile__ ("nop");__asm__ __volatile__ ("nop"); __asm__ __volatile__ ("nop");__asm__ __volatile__ ("nop"); __asm__ __volatile__ ("nop");  __asm__ __volatile__ ("nop"); __asm__ __volatile__ ("nop");__asm__ __volatile__ ("nop");  __asm__ __volatile__ ("nop");  __asm__ __volatile__ ("nop")
-#define WAIT_MID(a) __asm__ __volatile__ ("nop"); __asm__ __volatile__ ("nop"); __asm__ __volatile__ ("nop");  __asm__ __volatile__ ("nop"); __asm__ __volatile__ ("nop");__asm__ __volatile__ ("nop"); __asm__ __volatile__ ("nop");__asm__ __volatile__ ("nop"); __asm__ __volatile__ ("nop"); __asm__ __volatile__ ("nop"); __asm__ __volatile__ ("nop"); __asm__ __volatile__ ("nop"); __asm__ __volatile__ ("nop")
-#define WAIT_LIT(a) __asm__ __volatile__ ("nop"); __asm__ __volatile__ ("nop"); __asm__ __volatile__ ("nop");  __asm__ __volatile__ ("nop"); __asm__ __volatile__ ("nop");  __asm__ __volatile__ ("nop");  __asm__ __volatile__ ("nop");  __asm__ __volatile__ ("nop");  __asm__ __volatile__ ("nop")
+  2. Port register access (PORTC / PIND / PINB)
+     Those registers don't exist on ESP32. They're replaced with direct
+     GPIO register access (GPIO_OUT_W1TS_REG / GPIO_OUT_W1TC_REG /
+     GPIO_IN_REG) so the hot loop is still a handful of instructions,
+     same as on the AVR. NOTE: this fast path only works for GPIO0-31 --
+     all pins below are deliberately chosen from that range. If you
+     rewire to a pin >=32 you must switch to the *_REG1 registers.
 
+  3. The nop-counted delays (WAIT_LIT/MID/LOT)
+     AVR nops are 1 cycle @16 MHz (62.5 ns) and the compiler emits
+     exactly what you wrote. Neither is true on the ESP32 (240 MHz,
+     dual core, cache, FreeRTOS preemption), so counting nops there is
+     meaningless. Instead this version measures real elapsed CPU cycles
+     with the hardware cycle counter (ESP.getCycleCount()) and busy-waits
+     until the equivalent *time* (not instruction count) has passed --
+     the original nop counts were converted to nanoseconds at 16 MHz and
+     are re-scaled here to whatever the ESP32 is actually clocked at.
 
-#define OUTPUT_WAVE(pointer, d)  PORTC = pointer[d*N_PORTS + 0]
+  4. Watchdog
+     The original design blocks forever inside setup() via `goto LOOP`
+     and never yields. On the ESP32 that starves the idle task on
+     whichever core it runs on and the Task Watchdog will reboot the
+     chip. The tight loop is therefore run as its own FreeRTOS task,
+     pinned to one core, with that core's watchdog disabled.
 
-//half a second
+  5. Pin numbers
+     Picked to (a) stay in the 0-31 fast-GPIO bank and (b) avoid strapping
+     pins (0/2/5/12/15) and the flash pins (6-11). Change PIN_* below to
+     match your actual wiring -- these are just sane defaults for a
+     generic ESP32 DevKit.
+
+  For real (non-loopback) use, PIN_SYNC_IN should come from your actual
+  index/position sensor rather than being wired straight back to
+  PIN_SYNC_OUT -- the loopback wiring from the original comment is only
+  useful for bench-testing the timing.
+*/
+
+#include <Arduino.h>
+#include "soc/gpio_reg.h"
+#include "soc/soc.h"
+
+// ---------------- USER-CONFIGURABLE PIN MAP ----------------
+// 4-bit output nibble (was PORTC bits A0-A3 on the AVR)
+#define PIN_OUT0     18
+#define PIN_OUT1     19
+#define PIN_OUT2     21
+#define PIN_OUT3     22
+
+#define PIN_SYNC_OUT 25   // hardware 40kHz PWM out (was AVR pin 10)
+#define PIN_SYNC_IN  26   // sync in -- wire PIN_SYNC_OUT -> PIN_SYNC_IN for bench testing (was AVR pin 11)
+
+#define PIN_ENC_CLK   4   // rotary encoder CLK (was AVR pin 2)
+#define PIN_ENC_DT   13   // rotary encoder DT  (was AVR pin 3)
+#define PIN_ENC_SW   27   // rotary encoder SW  (was AVR pin 4)
+
+#define SYNC_FREQ_HZ 40000
+#define LEDC_RESOLUTION_BITS 8     // only need 50% duty, 8 bits is plenty
+#define RT_CORE 1                  // core the timing-critical loop runs on
+// -------------------------------------------------------------
+
+#define N_DIVS    24
+#define N_FRAMES  24
 #define STEP_SIZE 1
-#define BUTTON_SENS 2500 
-#define N_FRAMES 24
-
-// Number of consecutive loop passes CLK must hold a state before
-// we trust it (software debounce, since Timer0/millis is disabled)
+#define BUTTON_SENS 2500
 #define ENCODER_DEBOUNCE_LOOPS 3
 
-#define CLK 2
-#define DT 3
-#define SW 4
+// Original AVR nop counts converted to nanoseconds @16 MHz (62.5ns/cycle),
+// re-derived as ESP32 cycles at setup() time from the actual CPU clock.
+#define WAIT_LIT_NS 562   //  9 cycles @16MHz
+#define WAIT_MID_NS 812   // 13 cycles @16MHz
+#define WAIT_LOT_NS 875   // 14 cycles @16MHz
 
-int counter = 0;
-int currentState;
-int initState;
-unsigned long debounceDelay = 0;
+static uint32_t cyclesLit, cyclesMid, cyclesLot;
+
+static inline void delayCycles(uint32_t cycles) {
+  uint32_t start = ESP.getCycleCount();
+  while ((uint32_t)(ESP.getCycleCount() - start) < cycles) {
+    // busy-wait -- intentional, this is the timing-critical path
+  }
+}
 
 static byte frame = 0;
-static byte animation[N_FRAMES][N_DIVS] = 
+static byte animation[N_FRAMES][N_DIVS] =
 {{0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa},
 {0x9,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x6,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa},
 {0x9,0x9,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x6,0x6,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa},
@@ -56,97 +119,55 @@ static byte animation[N_FRAMES][N_DIVS] =
 {0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x9,0x9,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0x6,0x6},
 {0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x9,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0x6}};
 
+// Precomputed set/clear masks for every possible 4-bit nibble value (0-15),
+// built once in setup() from the PIN_OUT* assignments so the hot loop just
+// does two register writes per division, same as the AVR's single PORTC=.
+static uint32_t setMask[16];
+static uint32_t clearMask[16];
 
-void setup()
-{
+static uint32_t bitCLK, bitDT, bitSW, bitSyncIn;
 
-/*
- for (int i = 0; i < (N_PORTS*N_DIVS); ++i){
-    animation[frame][i] =  0;
-  }
+static inline void outputNibble(byte v) {
+  REG_WRITE(GPIO_OUT_W1TC_REG, clearMask[v]);
+  REG_WRITE(GPIO_OUT_W1TS_REG, setMask[v]);
+}
 
-  for (int i = 0; i < (N_PORTS*N_DIVS/2); ++i){
-     animation[frame][i] = 0b11111111;
-  }
-  
-  for(int i = 0; i < N_DIVS; ++i){
-    if (i % 2 == 0){
-      animation[frame][i * N_PORTS] |= 0b00000001;
-    }else{
-      animation[frame][i * N_PORTS] &= 0b11111110;
+// ---------------------------------------------------------------
+// Timing-critical loop -- runs forever, pinned to its own core.
+// This is the direct equivalent of the AVR's `goto LOOP;` block.
+// ---------------------------------------------------------------
+void rtLoopTask(void *pv) {
+  byte* emittingPointer = &animation[frame][0];
+  uint32_t buttonsIn;
+
+  bool encoderPin[3]; // [0]=CLK [1]=DT [2]=SW
+  short buttonCounter = 0;
+
+  byte clkReadState    = (REG_READ(GPIO_IN_REG) & bitCLK) ? 1 : 0;
+  byte lastCLK          = clkReadState;
+  byte clkDebounceCount = 0;
+
+  for (;;) {
+    // wait for sync line to go low (equivalent of while(PINB & ...))
+    while (REG_READ(GPIO_IN_REG) & bitSyncIn) { }
+
+    buttonsIn = REG_READ(GPIO_IN_REG);
+
+    outputNibble(emittingPointer[0]);                                delayCycles(cyclesLit);
+    outputNibble(emittingPointer[1]);                                delayCycles(cyclesMid);
+    outputNibble(emittingPointer[2]); encoderPin[0] = buttonsIn & bitCLK; delayCycles(cyclesMid);
+    outputNibble(emittingPointer[3]); encoderPin[1] = buttonsIn & bitDT;  delayCycles(cyclesMid);
+    outputNibble(emittingPointer[4]); encoderPin[2] = buttonsIn & bitSW;  delayCycles(cyclesMid);
+    outputNibble(emittingPointer[5]);                                delayCycles(cyclesMid);
+    outputNibble(emittingPointer[6]);                                delayCycles(cyclesMid);
+    outputNibble(emittingPointer[7]);                                delayCycles(cyclesMid);
+    for (int d = 8; d <= 22; ++d) {
+      outputNibble(emittingPointer[d]);
+      delayCycles(cyclesLot);
     }
-  }
-*/
-   DDRC = 0b00001111; //A0 to A3 are the signal outputs
-   PORTC = 0b00000000; 
-   
-   pinMode(10, OUTPUT); //pin 10 (B2) will generate a 40kHz signal to sync 
-   pinMode(11, INPUT_PULLUP); //pin 11 (B3) is the sync in
-   //please connect pin 10 to pin 11
+    outputNibble(emittingPointer[23]);
 
-   for (int i = 2; i < 5; ++i){ //pin 2 (CLK), 3 (DT), 4 (SW) are the encoder inputs
-    pinMode(i, INPUT_PULLUP); 
-   }
-
-  // generate a sync signal of 40khz in pin 10
-  noInterrupts();           // disable all interrupts
-  TCCR1A = bit (WGM10) | bit (WGM11) | bit (COM1B1); // fast PWM, clear OC1B on compare
-  TCCR1B = bit (WGM12) | bit (WGM13) | bit (CS10);   // fast PWM, no prescaler
-  OCR1A =  (F_CPU / 40000L) - 1;
-  OCR1B = (F_CPU / 40000L) / 2;
-  interrupts();             // enable all interrupts
-
-  // disable everything that we do not need 
-  ADCSRA = 0;  // ADC
-  power_adc_disable ();
-  power_spi_disable();
-  power_twi_disable();
-  power_timer0_disable();
-  //power_usart0_disable();
-  Serial.begin(115200);
-
- byte* emittingPointer = &animation[frame][0];
- byte buttonsPort = 0;
-
- bool encoderPin[3]; // [0]=CLK (pin2), [1]=DT (pin3), [2]=SW (pin4)
- volatile bool unused;  // unused - only exists to preserve original per-division cycle timing (must stay volatile or the compiler will strip it)
- short buttonCounter = 0;
-
- // --- encoder state (persists across LOOP iterations) ---
- byte clkReadState   = (PIND & 0b00000100) ? 1 : 0; // raw last-seen CLK level (pin2)
- byte lastCLK         = clkReadState;                // last CONFIRMED/debounced CLK level
- byte clkDebounceCount = 0;
-
-  LOOP:
-    while(PINB & 0b00001000); //wait for pin 11 (B3) to go low 
-    
-    OUTPUT_WAVE(emittingPointer, 0); buttonsPort = PIND; WAIT_LIT();
-    OUTPUT_WAVE(emittingPointer, 1); unused = (buttonsPort & 0b11111100) != 0b11111100; WAIT_MID();
-    OUTPUT_WAVE(emittingPointer, 2); encoderPin[0] = buttonsPort & 0b00000100; WAIT_MID(); // CLK (pin2)
-    OUTPUT_WAVE(emittingPointer, 3); encoderPin[1] = buttonsPort & 0b00001000; WAIT_MID(); // DT  (pin3)
-    OUTPUT_WAVE(emittingPointer, 4); encoderPin[2] = buttonsPort & 0b00010000; WAIT_MID(); // SW  (pin4)
-    OUTPUT_WAVE(emittingPointer, 5); unused = buttonsPort & 0b00100000; WAIT_MID();
-    OUTPUT_WAVE(emittingPointer, 6); unused = buttonsPort & 0b01000000; WAIT_MID();
-    OUTPUT_WAVE(emittingPointer, 7); unused = buttonsPort & 0b10000000; WAIT_MID();
-    OUTPUT_WAVE(emittingPointer, 8); WAIT_LOT();
-    OUTPUT_WAVE(emittingPointer, 9); WAIT_LOT();
-    OUTPUT_WAVE(emittingPointer, 10); WAIT_LOT();
-    OUTPUT_WAVE(emittingPointer, 11); WAIT_LOT();
-    OUTPUT_WAVE(emittingPointer, 12); WAIT_LOT();
-    OUTPUT_WAVE(emittingPointer, 13); WAIT_LOT();
-    OUTPUT_WAVE(emittingPointer, 14); WAIT_LOT();
-    OUTPUT_WAVE(emittingPointer, 15); WAIT_LOT();
-    OUTPUT_WAVE(emittingPointer, 16); WAIT_LOT();
-    OUTPUT_WAVE(emittingPointer, 17); WAIT_LOT();
-    OUTPUT_WAVE(emittingPointer, 18); WAIT_LOT();
-    OUTPUT_WAVE(emittingPointer, 19); WAIT_LOT();
-    OUTPUT_WAVE(emittingPointer, 20); WAIT_LOT();
-    OUTPUT_WAVE(emittingPointer, 21); WAIT_LOT();
-    OUTPUT_WAVE(emittingPointer, 22); WAIT_LOT();
-    OUTPUT_WAVE(emittingPointer, 23); 
-
-
-    // --- ROTATION: debounce CLK over a few loop passes, then read DT at the edge ---
+    // --- ROTATION: debounce CLK over a few loop passes, read DT at the edge ---
     {
       byte curCLK = encoderPin[0];
 
@@ -162,14 +183,14 @@ void setup()
           byte curDT = encoderPin[1];
           if (curDT != clkReadState) {
             // DT HIGH while CLK LOW: clockwise -> down
-            if ( frame < STEP_SIZE ) {
+            if (frame < STEP_SIZE) {
               frame = N_FRAMES - 1;
             } else {
               frame -= STEP_SIZE;
             }
           } else {
             // DT LOW while CLK LOW: counter-clockwise -> up
-            if ( frame >= N_FRAMES - STEP_SIZE ) {
+            if (frame >= N_FRAMES - STEP_SIZE) {
               frame = 0;
             } else {
               frame += STEP_SIZE;
@@ -181,20 +202,81 @@ void setup()
       }
     }
 
-    // --- SW (encoder push button): hold to reset to frame 0, same debounce style as before ---
-    if (! encoderPin[2]) {
-       ++buttonCounter;
-       if (buttonCounter > BUTTON_SENS){
+    // --- SW (encoder push button): hold to reset to frame 0 ---
+    if (!encoderPin[2]) {
+      ++buttonCounter;
+      if (buttonCounter > BUTTON_SENS) {
         buttonCounter = 0;
         frame = 0;
-        emittingPointer = & animation[frame][0];
-       }
+        emittingPointer = &animation[frame][0];
+      }
     } else {
       buttonCounter = 0;
     }
-
-  goto LOOP;
-  
+  }
 }
 
-void loop(){}
+void setup() {
+  pinMode(PIN_OUT0, OUTPUT);
+  pinMode(PIN_OUT1, OUTPUT);
+  pinMode(PIN_OUT2, OUTPUT);
+  pinMode(PIN_OUT3, OUTPUT);
+  digitalWrite(PIN_OUT0, LOW);
+  digitalWrite(PIN_OUT1, LOW);
+  digitalWrite(PIN_OUT2, LOW);
+  digitalWrite(PIN_OUT3, LOW);
+
+  pinMode(PIN_SYNC_IN, INPUT);
+  pinMode(PIN_ENC_CLK, INPUT_PULLUP);
+  pinMode(PIN_ENC_DT,  INPUT_PULLUP);
+  pinMode(PIN_ENC_SW,  INPUT_PULLUP);
+
+  Serial.begin(115200);
+
+  // Build the set/clear bitmasks for every 4-bit nibble value once.
+  const int outPins[4] = {PIN_OUT0, PIN_OUT1, PIN_OUT2, PIN_OUT3};
+  for (int v = 0; v < 16; ++v) {
+    uint32_t s = 0, c = 0;
+    for (int b = 0; b < 4; ++b) {
+      if (v & (1 << b)) s |= (1UL << outPins[b]);
+      else               c |= (1UL << outPins[b]);
+    }
+    setMask[v] = s;
+    clearMask[v] = c;
+  }
+
+  bitCLK    = 1UL << PIN_ENC_CLK;
+  bitDT     = 1UL << PIN_ENC_DT;
+  bitSW     = 1UL << PIN_ENC_SW;
+  bitSyncIn = 1UL << PIN_SYNC_IN;
+
+  // Re-derive the original AVR nop-timings as ESP32 cycle counts, scaled
+  // to whatever clock speed this chip is actually running at.
+  uint64_t cpuHz = (uint64_t)getCpuFrequencyMhz() * 1000000ULL;
+  cyclesLit = (uint32_t)((uint64_t)WAIT_LIT_NS * cpuHz / 1000000000ULL);
+  cyclesMid = (uint32_t)((uint64_t)WAIT_MID_NS * cpuHz / 1000000000ULL);
+  cyclesLot = (uint32_t)((uint64_t)WAIT_LOT_NS * cpuHz / 1000000000ULL);
+
+  // Precise hardware 40kHz sync out via LEDC (Arduino-ESP32 core v3.x API).
+  // If you're on core v2.x, replace these two lines with:
+  //   ledcSetup(0, SYNC_FREQ_HZ, LEDC_RESOLUTION_BITS);
+  //   ledcAttachPin(PIN_SYNC_OUT, 0);
+  //   ledcWrite(0, 1 << (LEDC_RESOLUTION_BITS - 1));
+  ledcAttach(PIN_SYNC_OUT, SYNC_FREQ_HZ, LEDC_RESOLUTION_BITS);
+  ledcWrite(PIN_SYNC_OUT, 1 << (LEDC_RESOLUTION_BITS - 1)); // 50% duty
+
+  // The real-time task below never yields, so stop the watchdog from
+  // panicking and pin it to one dedicated core.
+  disableCore0WDT();
+  disableCore1WDT();
+
+  xTaskCreatePinnedToCore(
+    rtLoopTask, "rt_loop", 4096, NULL,
+    configMAX_PRIORITIES - 1, NULL, RT_CORE
+  );
+}
+
+void loop() {
+  // Everything happens in rtLoopTask; nothing to do here.
+  vTaskDelay(portMAX_DELAY);
+}
