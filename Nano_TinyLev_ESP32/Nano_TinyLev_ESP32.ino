@@ -1,48 +1,3 @@
-/*
-  TinyLev firmware — ESP32 (Arduino) port
-  ----------------------------------------
-  Ported from an AVR/ATmega328 (Arduino Nano) version that used direct
-  PORTC/PIND register access, Timer1 PWM registers, and hand-tuned NOP
-  delay loops. None of that exists on ESP32, so this version uses:
-
-    - direct GPIO register writes for the phase-output nibble (a single
-      register write per step instead of 4x digitalWrite() calls, which
-      were far too slow to fit the 40kHz budget)
-    - digitalRead for the buttons
-    - a CPU-cycle busy-wait (ESP.getCycleCount()) instead of NOP counts
-    - disableLoopWDT() because this sketch never returns from setup()
-      and never yields, which would otherwise trip the watchdog and
-      reboot the board.
-
-  NOTE ON THE SYNC SIGNAL: the original AVR version generated its own
-  40kHz reference on one pin (via Timer1) and read it back on another
-  pin, requiring a jumper wire between them. Since the ESP32 is the one
-  generating that signal in the first place, there's no need to loop it
-  back through a GPIO at all — we just track the same 25us period
-  directly against ESP.getCycleCount(). This removes the jumper wire
-  and both sync pins entirely.
-
-  *** PER-STEP TIMING (no manual tuning needed) ***
-  Earlier versions of this port used hand-guessed WAIT_LIT/MID/LOT
-  cycle counts, then a two-stage "measure fixed cost, add proportional
-  delay" calibration. Both were indirect enough to drift: the second
-  approach in particular could end up bursting all 24 steps out early
-  in the period and then holding flat for the rest, which distorted
-  the output waveform and caused an audible artifact.
-
-  This version instead paces each of the 24 steps against its own
-  absolute deadline (in CPU cycles from the start of the 25us period),
-  computed once in setupStepOffsets(). This is the same self-correcting
-  technique already used for the outer 40kHz loop: whatever time button
-  reads or the register writes themselves take just eats into the gap
-  before the next step's deadline, rather than accumulating drift or
-  bunching transitions together. The 24 steps keep the same relative
-  LIT:MID:LOT proportions the original AVR NOP counts used (9:13:14),
-  scaled to fill exactly one 40kHz period.
-*/
-
-#include "soc/gpio_struct.h"
-
 #define N_PORTS 1
 #define N_DIVS 24
 #define N_FRAMES 24
@@ -94,6 +49,8 @@ static uint32_t CYCLES_LIT = 0, CYCLES_MID = 0, CYCLES_LOT = 0;
 // ---------------------------------------------------------------------
 static uint32_t nibbleSetMaskLo[16], nibbleClearMaskLo[16];
 static uint32_t nibbleSetMaskHi[16], nibbleClearMaskHi[16];
+
+
 
 static inline void writeNibble(uint8_t nibble) {
   GPIO.out_w1ts = nibbleSetMaskLo[nibble];
@@ -169,6 +126,16 @@ static bool anyButtonPressed;
 static bool buttonPressed[N_BUTTONS];
 static short buttonCounter = 0;
 
+// Simulated "held button" state for WASD-over-Serial control (see
+// readComputerControls() below). Each keypress latches a virtual press
+// for COMPUTER_HOLD_MS milliseconds so it behaves like a physical held
+// button long enough to cross BUTTON_SENS.
+static uint32_t computerPressedUntil[N_BUTTONS] = {0};
+static const uint32_t COMPUTER_HOLD_MS = 60; // tune if BUTTON_SENS needs more/less
+static inline bool isComputerPressed(uint8_t i) {
+  return (int32_t)(millis() - computerPressedUntil[i]) < 0;
+}
+
 // Absolute per-step target times (in CPU cycles from the start of the
 // iteration) for each of the 24 output steps. Computed once in
 // setupStepOffsets() below. stepOffset[0] is always 0 — step 0 fires
@@ -225,8 +192,9 @@ static uint32_t runIterationBody() {
     OUTPUT_WAVE(emittingPointer, d);
 
     if (d == 0) {
+      readComputerControls();
       for (uint8_t i = 0; i < N_BUTTONS; ++i) {
-        buttonPressed[i] = (digitalRead(buttonPins[i]) == LOW);
+        buttonPressed[i] = (digitalRead(buttonPins[i]) == LOW) || isComputerPressed(i);
       }
     } else if (d == 1) {
       anyButtonPressed = false;
@@ -278,7 +246,9 @@ static uint32_t runIterationBody() {
   }
 
   return ESP.getCycleCount() - t0;
+
 }
+
 
 void setup()
 {

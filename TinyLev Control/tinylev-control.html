@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TinyLev — BLE Control</title>
+<style>
+  :root {
+    --bg: #0b0f0d;
+    --panel: #101613;
+    --line: #22302a;
+    --phosphor: #4fe38a;
+    --phosphor-dim: #2c7a52;
+    --amber: #e8a13a;
+    --text: #d7e4dc;
+    --text-dim: #6d8377;
+    --mono: "SF Mono", "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+    --sans: "Inter", -apple-system, "Segoe UI", sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: var(--bg);
+    background-image:
+      radial-gradient(circle at 50% 0%, rgba(79,227,138,0.06), transparent 60%);
+    color: var(--text);
+    font-family: var(--sans);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+
+  .instrument {
+    width: 100%;
+    max-width: 480px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    box-shadow: 0 0 0 1px rgba(0,0,0,0.4), 0 20px 60px rgba(0,0,0,0.5);
+  }
+
+  .instrument__header {
+    padding: 18px 22px;
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+  }
+
+  .instrument__title {
+    font-family: var(--mono);
+    font-size: 14px;
+    letter-spacing: 0.04em;
+    color: var(--text);
+  }
+
+  .instrument__title span {
+    color: var(--phosphor);
+  }
+
+  .instrument__sub {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+
+  .readout {
+    margin: 20px 22px;
+    padding: 18px 20px;
+    background: #070a08;
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    font-family: var(--mono);
+  }
+
+  .readout__row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 5px 0;
+  }
+
+  .readout__label {
+    font-size: 11px;
+    color: var(--text-dim);
+    letter-spacing: 0.03em;
+  }
+
+  .readout__value {
+    font-size: 13px;
+    color: var(--phosphor);
+  }
+
+  .readout__value.is-off {
+    color: var(--text-dim);
+  }
+
+  .dot {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--text-dim);
+    margin-right: 7px;
+    position: relative;
+    top: -1px;
+  }
+
+  .dot.is-live {
+    background: var(--phosphor);
+    box-shadow: 0 0 8px var(--phosphor);
+  }
+
+  .connect-row {
+    margin: 0 22px 20px;
+  }
+
+  button.connect {
+    width: 100%;
+    padding: 13px;
+    background: transparent;
+    border: 1px solid var(--phosphor-dim);
+    color: var(--phosphor);
+    font-family: var(--mono);
+    font-size: 13px;
+    letter-spacing: 0.03em;
+    border-radius: 3px;
+    cursor: pointer;
+    transition: border-color 0.15s ease, background 0.15s ease;
+  }
+
+  button.connect:hover { border-color: var(--phosphor); background: rgba(79,227,138,0.06); }
+  button.connect:focus-visible { outline: 2px solid var(--phosphor); outline-offset: 2px; }
+
+  button.connect.is-connected {
+    border-color: var(--amber);
+    color: var(--amber);
+  }
+  button.connect.is-connected:hover { background: rgba(232,161,58,0.08); }
+
+  .keys {
+    padding: 0 22px 24px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+
+  .key {
+    grid-column: span 1;
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    padding: 14px 12px;
+    text-align: center;
+    cursor: pointer;
+    user-select: none;
+    background: transparent;
+    color: var(--text);
+    font-family: var(--sans);
+    transition: border-color 0.08s ease, background 0.08s ease;
+  }
+
+  .key:focus-visible { outline: 2px solid var(--phosphor); outline-offset: 2px; }
+
+  .key--reset { grid-column: span 2; }
+
+  .key.is-active {
+    border-color: var(--phosphor);
+    background: rgba(79,227,138,0.1);
+  }
+
+  .key__action {
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .key__bind {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-dim);
+    margin-top: 4px;
+    letter-spacing: 0.02em;
+  }
+
+  .footnote {
+    padding: 14px 22px 20px;
+    border-top: 1px solid var(--line);
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--text-dim);
+  }
+
+  .footnote strong { color: var(--text); }
+
+  .warn {
+    margin: 0 22px 18px;
+    padding: 10px 12px;
+    border: 1px solid #4a3418;
+    background: rgba(232,161,58,0.06);
+    color: var(--amber);
+    font-size: 12px;
+    border-radius: 3px;
+    display: none;
+  }
+
+  .warn.is-shown { display: block; }
+</style>
+</head>
+<body>
+
+<div class="instrument">
+  <div class="instrument__header">
+    <div class="instrument__title">TINYLEV <span>CONTROL</span></div>
+    <div class="instrument__sub">Web Bluetooth</div>
+  </div>
+
+  <div class="warn" id="warn">
+    This browser doesn't support Web Bluetooth. Use Chrome or Edge on desktop.
+  </div>
+
+  <div class="readout">
+    <div class="readout__row">
+      <span class="readout__label">LINK</span>
+      <span class="readout__value is-off" id="linkStatus"><span class="dot" id="linkDot"></span>disconnected</span>
+    </div>
+    <div class="readout__row">
+      <span class="readout__label">DEVICE</span>
+      <span class="readout__value is-off" id="deviceName">—</span>
+    </div>
+    <div class="readout__row">
+      <span class="readout__label">FRAME</span>
+      <span class="readout__value is-off" id="frameValue">—</span>
+    </div>
+    <div class="readout__row">
+      <span class="readout__label">LAST CMD</span>
+      <span class="readout__value is-off" id="lastCmd">—</span>
+    </div>
+  </div>
+
+  <div class="connect-row">
+    <button class="connect" id="connectBtn">Connect to TinyLev</button>
+  </div>
+
+  <div class="keys">
+    <div class="key" id="keyUp" tabindex="0" role="button">
+      <div class="key__action">Phase up</div>
+      <div class="key__bind">W / Page Up</div>
+    </div>
+    <div class="key" id="keyDown" tabindex="0" role="button">
+      <div class="key__action">Phase down</div>
+      <div class="key__bind">S / Page Down</div>
+    </div>
+    <div class="key key--reset" id="keyReset" tabindex="0" role="button">
+      <div class="key__action">Reset to frame 0</div>
+      <div class="key__bind">Esc</div>
+    </div>
+  </div>
+
+  <div class="footnote">
+    <strong>Keyboard works once connected</strong> — click anywhere on this page first so it can catch keypresses, then use W / S / Page Up / Page Down / Esc as normal. The buttons above work by click too, for phones/touch.
+  </div>
+</div>
+
+<script>
+  const SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+  const RX_UUID      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // write: browser -> device
+  const TX_UUID      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // notify: device -> browser
+
+  const connectBtn  = document.getElementById("connectBtn");
+  const linkStatus  = document.getElementById("linkStatus");
+  const linkDot     = document.getElementById("linkDot");
+  const deviceName  = document.getElementById("deviceName");
+  const frameValue  = document.getElementById("frameValue");
+  const lastCmd     = document.getElementById("lastCmd");
+  const warn        = document.getElementById("warn");
+
+  const keyUp    = document.getElementById("keyUp");
+  const keyDown  = document.getElementById("keyDown");
+  const keyReset = document.getElementById("keyReset");
+
+  let device = null;
+  let rxChar = null;
+
+  if (!navigator.bluetooth) {
+    warn.classList.add("is-shown");
+    connectBtn.disabled = true;
+  }
+
+  function setConnected(connected, name) {
+    if (connected) {
+      linkStatus.classList.remove("is-off");
+      linkDot.classList.add("is-live");
+      linkStatus.lastChild.textContent = "connected";
+      deviceName.classList.remove("is-off");
+      deviceName.textContent = name || "TinyLev";
+      connectBtn.textContent = "Disconnect";
+      connectBtn.classList.add("is-connected");
+    } else {
+      linkStatus.classList.add("is-off");
+      linkDot.classList.remove("is-live");
+      linkStatus.lastChild.textContent = "disconnected";
+      deviceName.classList.add("is-off");
+      deviceName.textContent = "—";
+      frameValue.classList.add("is-off");
+      frameValue.textContent = "—";
+      connectBtn.textContent = "Connect to TinyLev";
+      connectBtn.classList.remove("is-connected");
+      rxChar = null;
+    }
+  }
+
+  async function connect() {
+    try {
+      device = await navigator.bluetooth.requestDevice({
+        filters: [{ services: [SERVICE_UUID] }]
+      });
+
+      device.addEventListener("gattserverdisconnected", () => setConnected(false));
+
+      // Chromium on Windows has a well-documented quirk where the first
+      // gatt.connect() sometimes drops right before service discovery
+      // completes, throwing "GATT Server is disconnected. Cannot
+      // retrieve services." Simply retrying immediately afterward
+      // reliably succeeds, so we do that automatically here rather
+      // than making you click Connect twice by hand.
+      const MAX_ATTEMPTS = 4;
+      let lastErr = null;
+
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        try {
+          const server = await device.gatt.connect();
+          const service = await server.getPrimaryService(SERVICE_UUID);
+          rxChar = await service.getCharacteristic(RX_UUID);
+
+          try {
+            const txChar = await service.getCharacteristic(TX_UUID);
+            await txChar.startNotifications();
+            txChar.addEventListener("characteristicvaluechanged", onStatusNotify);
+          } catch (e) {
+            // TX notifications are a nice-to-have for the FRAME readout —
+            // control still works without them.
+          }
+
+          setConnected(true, device.name);
+          return; // success
+        } catch (err) {
+          lastErr = err;
+          console.warn(`Connect attempt ${attempt}/${MAX_ATTEMPTS} failed:`, err.message);
+          if (attempt < MAX_ATTEMPTS) {
+            await new Promise(resolve => setTimeout(resolve, 400));
+          }
+        }
+      }
+
+      throw lastErr; // all attempts failed
+    } catch (err) {
+      console.error(err);
+      if (err.name !== "NotFoundError") {
+        alert("Couldn't connect: " + err.message);
+      }
+    }
+  }
+
+  function disconnect() {
+    if (device && device.gatt.connected) {
+      device.gatt.disconnect();
+    }
+    setConnected(false);
+  }
+
+  connectBtn.addEventListener("click", () => {
+    if (device && device.gatt.connected) {
+      disconnect();
+    } else {
+      connect();
+    }
+  });
+
+  function onStatusNotify(event) {
+    const text = new TextDecoder().decode(event.target.value).trim();
+    const match = text.match(/^(\w+):(\d+)/);
+    if (match) {
+      frameValue.classList.remove("is-off");
+      frameValue.textContent = match[2] + (match[1] === "reset" ? " (reset)" : "");
+    }
+  }
+
+  async function sendByte(byteValue, label, keyEl) {
+    if (!rxChar) return;
+    try {
+      await rxChar.writeValueWithoutResponse(new Uint8Array([byteValue]));
+      lastCmd.classList.remove("is-off");
+      lastCmd.textContent = label;
+    } catch (err) {
+      console.error("write failed", err);
+    }
+    if (keyEl) flashKey(keyEl);
+  }
+
+  function flashKey(keyEl) {
+    keyEl.classList.add("is-active");
+    setTimeout(() => keyEl.classList.remove("is-active"), 130);
+  }
+
+  const sendUp    = () => sendByte(0x77, "up (w)", keyUp);      // 'w'
+  const sendDown  = () => sendByte(0x73, "down (s)", keyDown);  // 's'
+  const sendReset = () => sendByte(0x1b, "reset (esc)", keyReset); // ESC
+
+  keyUp.addEventListener("click", sendUp);
+  keyDown.addEventListener("click", sendDown);
+  keyReset.addEventListener("click", sendReset);
+
+  window.addEventListener("keydown", (e) => {
+    // Ignore repeats from held keys firing too fast for BLE writes to keep up.
+    if (e.repeat) return;
+    switch (e.key) {
+      case "w": case "W": case "PageUp":
+        e.preventDefault(); sendUp(); break;
+      case "s": case "S": case "PageDown":
+        e.preventDefault(); sendDown(); break;
+      case "Escape":
+        e.preventDefault(); sendReset(); break;
+    }
+  });
+</script>
+
+</body>
+</html>
