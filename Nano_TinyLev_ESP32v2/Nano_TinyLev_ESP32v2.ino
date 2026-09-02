@@ -1,85 +1,73 @@
-/*
-
-  TinyLev firmware — Arduino Nano ESP32 port (RMT hardware waveform)
-  --------------------------------------------------------------------
-  Rebuilt from the original AVR/ATmega328 (Arduino Nano) sketch, which
-  used direct PORTC/PIND register access, a Timer1-generated 40kHz
-  sync signal looped back through a jumper wire (pin 10 -> pin 11),
-  and hand-tuned NOP delay loops. None of that exists on ESP32, and
-  earlier attempts at a software busy-wait port were vulnerable to
-  timing jitter from ESP32's underlying scheduler (FreeRTOS), which
-  showed up as an audible artifact on top of the ultrasonic carrier.
-
-  This version instead uses the ESP32's RMT peripheral — hardware
-  originally built for generating IR remote-control pulse trains, and
-  equally good at "output exactly this repeating pattern of pin
-  transitions, forever, with zero CPU involvement." One RMT channel
-  drives each of the 4 output pins directly, in hardware, looping
-  indefinitely. Once programmed, the CPU is completely uninvolved in
-  producing the waveform: no busy-wait, no interrupt sensitivity, no
-  jitter, and no jumper wire needed (the ESP32 just tracks its own
-  40kHz timing internally rather than looping a signal back to itself
-  through two pins the way the original did).
-
-  TIMING, matched carefully to the original:
-  The original's 23 explicit NOP-delays (1x WAIT_LIT=9 nops, 7x
-  WAIT_MID=13 nops, 15x WAIT_LOT=14 nops) sum to exactly 310 "weight
-  units". The 24th gap — step 23 wrapping back around to step 0 — was
-  never explicitly timed in the original; it was simply whatever time
-  was left over within the 25us period, governed by the external
-  40kHz hardware timer. This version reproduces that faithfully:
-  steps 0-22 get durations scaled from the same 310-unit total, and
-  step 23's duration is calculated as the exact remainder needed to
-  complete one full 25us (40kHz) period — not an invented extra
-  category, just like the original.
-
-  *** IF FIRMWARE LOOKS CORRECT BUT LEVITATION STILL DOESN'T WORK ***
-  The Arduino Nano ESP32 outputs 3.3V logic; the original Arduino Nano
-  output 5V. If your MOSFET/gate-driver board needs a 5V signal to
-  fully switch on, you can get a technically-correct, audible,
-  correctly phase-shifting signal that is simply too weak to drive the
-  transducers with enough acoustic power to levitate anything. Worth
-  checking your driver board's input voltage spec / switching
-  threshold with a multimeter or scope once you've confirmed the
-  firmware itself is behaving as expected.
-
-  *** THINGS TO VERIFY ON YOUR HARDWARE / BUILD ***
-  - RMT_CHANNEL_0..3 are used for the 4 output pins. Channel
-    enumeration/count for TX use can vary between ESP32 variants and
-    ESP-IDF/Arduino-ESP32 core versions — if the compiler complains
-    about channel count or capability, check driver/rmt.h for your
-    installed core version and adjust rmtChannels[] accordingly.
-  - This uses the *legacy* driver/rmt.h API (matches Arduino-ESP32
-    core 2.0.18). If you upgrade to core 3.x later, the newer
-    driver/rmt_tx.h API is different and this will need porting again.
-*/
-
+#include <Arduino.h>
 #include "driver/rmt.h"
+#include "driver/gpio.h"
+#include "rom/gpio.h"          // gpio_matrix_out()
+#include "soc/gpio_sig_map.h"  // RMT_SIG_OUT0_IDX etc.
+#include <NimBLEDevice.h>      // NimBLE-Arduino 2.5.1 — single header covers server/service/characteristic
 
-#define N_DIVS 24
-#define N_FRAMES 24
-#define N_BUTTONS 6
-#define STEP_SIZE 1
-#define SYNC_FREQ_HZ 40000
-#define BUTTON_HOLD_MS 62   // ~= original BUTTON_SENS (2500 loop iterations @ 40kHz)
+#define N_DIVS             24
+#define N_FRAMES           24
+#define N_BUTTONS           6
+#define STEP_SIZE           1
+#define SYNC_FREQ_HZ     40000UL
 
-// Uncomment to print frame-change debug info to Serial.
-#define BUTTON_DEBUG
+#define RMT_CLK_DIV          1
+#define RMT_TICK_HZ   80000000UL
+#define PERIOD_TICKS       2000UL
+#define BUTTON_HOLD_MS       63
 
 // ---------------------------------------------------------------------
-// PIN CONFIGURATION — adjust these to match your ESP32 board's wiring.
-// The four OUT pins carry the same 4-bit nibble that used to go to
-// PORTC bits 0-3 (i.e. bit0..bit3 of animation[frame][d]).
+// PIN CONFIGURATION
 // ---------------------------------------------------------------------
-#define OUT_PIN_0   A0   // was PC0
-#define OUT_PIN_1   A1   // was PC1
-#define OUT_PIN_2   A2   // was PC2
-#define OUT_PIN_3   A3   // was PC3
+// OUT_PIN_0 / OUT_PIN_1 form one complementary pair (drives AIN1/AIN2 ->
+// AO1/AO2 on the TB6612). OUT_PIN_2 / OUT_PIN_3 form the other pair
+// (BIN1/BIN2 -> BO1/BO2).
+//
+// *** WHY THIS VERSION ONLY PROGRAMS 2 RMT CHANNELS INSTEAD OF 4 ***
+// Scope captures showed AO1/AO2 not staying in sync on the ESP32,
+// while the same points on the original AVR Nano stayed perfectly
+// synced. The reason: on AVR, `PORTC = value` updates all 4 output
+// bits in one single CPU instruction — bit0 and bit1 physically cannot
+// go out of step. On ESP32, each output pin was its own independent
+// RMT hardware channel, each started by a separate function call a few
+// CPU cycles apart — enough for a small, constant timing skew between
+// channels, even though their loop periods were identical.
+//
+// The animation table always keeps each pair's two bits as exact
+// logical opposites (verified: for every value actually used — 0x5,
+// 0x6, 0x9, 0xa — bit0/bit1 are always complementary, and so are
+// bit2/bit3). So instead of driving both pins of a pair from separate
+// RMT channels and hoping they stay aligned, this version drives only
+// the FIRST pin of each pair from an RMT channel, and generates the
+// SECOND pin as a hardware-inverted mirror of that same signal via the
+// ESP32's GPIO matrix (gpio_matrix_out). The two pins are then driven
+// by the literal same hardware edge, just electrically inverted —
+// they cannot desync, rather than just "closely timed".
+//
+// *** CONFIRMED WORKING STATE ***
+// AO1/AO2 and BO1/BO2 both verified in sync on scope, phase shifting
+// confirmed correct, once OUT_PIN_3 was wired to the physical A3 pin
+// (a miswiring to A4 was the earlier cause of BO1/BO2 not matching
+// AO1/AO2 — this was a wiring bug, not a firmware bug).
+//
+// *** THING TO VERIFY IF THIS DOESN'T COMPILE ***
+// RMT_SIG_OUT0_IDX (and RMT_SIG_OUT0_IDX+1 for channel 1) is the
+// standard ESP-IDF macro name for "GPIO matrix signal ID for RMT TX
+// channel N's output" — this has been consistent across ESP32 variants
+// historically, but if your installed core's soc/gpio_sig_map.h uses a
+// different name, search that header (inside your Arduino-ESP32 core
+// installation folder) for "RMT_SIG" and swap in whatever it defines.
+#define OUT_PIN_0   A0   // primary, pair A (bit0) -> AIN1
+#define OUT_PIN_1   A1   // mirror,  pair A (bit1, hw-inverted copy of OUT_PIN_0) -> AIN2
+#define OUT_PIN_2   A2   // primary, pair B (bit2) -> BIN1
+#define OUT_PIN_3   A3   // mirror,  pair B (bit3, hw-inverted copy of OUT_PIN_2) -> BIN2
+                          // NOTE: must be the physical A3 pin, not A4 — a miswire here
+                          // was the original cause of BO1/BO2 not matching AO1/AO2.
 
-// Button pins (was PIND bits 2-7 / Arduino D2-D7)
-static const uint8_t buttonPins[N_BUTTONS] = {2, 3, 4, 5, 6, 7};
+static const uint8_t buttonPins[N_BUTTONS] = { 2, 3, 4, 5, 6, 7 };
 
 static byte frame = 0;
+
 static byte animation[N_FRAMES][N_DIVS] =
 {{0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa},
 {0x9,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x6,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa},
@@ -106,186 +94,311 @@ static byte animation[N_FRAMES][N_DIVS] =
 {0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x9,0x9,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0x6,0x6},
 {0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x5,0x9,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0xa,0x6}};
 
-// ---------------------------------------------------------------------
-// Timing — relative proportions taken directly from the original AVR
-// NOP counts (WAIT_LIT=9, WAIT_MID=13, WAIT_LOT=14 nops).
-// ---------------------------------------------------------------------
-#define WEIGHT_LIT 9
-#define WEIGHT_MID 13
-#define WEIGHT_LOT 14
+static uint16_t stepTicks[N_DIVS];
 
-#define RMT_CLK_DIV 1
-#define RMT_TICK_HZ (80000000UL / RMT_CLK_DIV)                          // 80MHz -> 12.5ns/tick
-#define PERIOD_TICKS ((uint32_t)((uint64_t)RMT_TICK_HZ / SYNC_FREQ_HZ))  // ticks per 40kHz period (2000 exactly)
+// Only 2 RMT channels now — one per complementary pair (see comment
+// block above OUT_PIN_0). rmtItems[0] carries bit0 (drives OUT_PIN_0
+// directly, and OUT_PIN_1 as its hardware-inverted mirror). rmtItems[1]
+// carries bit2 (drives OUT_PIN_2 directly, OUT_PIN_3 as its mirror).
+static const rmt_channel_t rmtChannels[2] = { RMT_CHANNEL_0, RMT_CHANNEL_1 };
+static rmt_item32_t rmtItems[2][N_DIVS / 2];
+static const int primaryBit[2] = { 0, 2 };
 
-static uint32_t stepDuration[N_DIVS]; // RMT ticks each of the 24 steps holds its level for
+static void computeStepTicks() {
+  const uint32_t base = PERIOD_TICKS / N_DIVS;
+  const uint32_t rem = PERIOD_TICKS % N_DIVS;
+  uint32_t total = 0;
 
-// Computes stepDuration[] so steps 0-22 keep the original's exact
-// relative proportions (1x LIT, 7x MID, 15x LOT — 310 weight units
-// total, matching the original NOP counts exactly), and step 23 (the
-// wrap back to step 0) gets whatever's left over to complete exactly
-// one 40kHz period — the same way the original left that gap to the
-// external hardware timer rather than assigning it an explicit delay.
-static void computeStepDurations() {
-  const uint32_t totalWeight = WEIGHT_LIT + 7 * WEIGHT_MID + 15 * WEIGHT_LOT; // = 310
-  const uint32_t unit = PERIOD_TICKS / totalWeight;
+  for (int d = 0; d < N_DIVS; ++d) {
+    stepTicks[d] = (uint16_t)(base + ((uint32_t)d < rem ? 1 : 0));
+    total += stepTicks[d];
+  }
 
-  stepDuration[0] = unit * WEIGHT_LIT;                                   // after step0
-  for (int d = 1; d <= 7; ++d)  stepDuration[d] = unit * WEIGHT_MID;      // after steps1-7 (7x)
-  for (int d = 8; d <= 22; ++d) stepDuration[d] = unit * WEIGHT_LOT;      // after steps8-22 (15x)
-
-  uint32_t used = 0;
-  for (int d = 0; d < N_DIVS - 1; ++d) used += stepDuration[d];
-  stepDuration[N_DIVS - 1] = PERIOD_TICKS - used; // step23: true remainder, not an invented category
+  if (total != PERIOD_TICKS) {
+    Serial.printf("FATAL: RMT timing calculation error: %lu != %lu\n", (unsigned long)total, (unsigned long)PERIOD_TICKS);
+    while (true) delay(1000);
+  }
 }
 
-// ---------------------------------------------------------------------
-// RMT setup — one channel per output pin, each looping its own 12-item
-// (24-step) instruction list forever, entirely in hardware.
-// ---------------------------------------------------------------------
-static const rmt_channel_t rmtChannels[4] = {
-  RMT_CHANNEL_0, RMT_CHANNEL_1, RMT_CHANNEL_2, RMT_CHANNEL_3
-};
-
-static rmt_item32_t rmtItems[4][N_DIVS / 2]; // 2 steps pack into one rmt_item32_t
-
 static void buildRmtItemsForFrame(byte f) {
-  byte* pat = &animation[f][0];
-  for (int ch = 0; ch < 4; ++ch) {
+  for (int g = 0; g < 2; ++g) {
+    const int bit = primaryBit[g];
     for (int pair = 0; pair < N_DIVS / 2; ++pair) {
-      int d0 = pair * 2, d1 = d0 + 1;
-      rmtItems[ch][pair].level0    = (pat[d0] >> ch) & 0x1;
-      rmtItems[ch][pair].duration0 = stepDuration[d0];
-      rmtItems[ch][pair].level1    = (pat[d1] >> ch) & 0x1;
-      rmtItems[ch][pair].duration1 = stepDuration[d1];
+      const int d0 = pair * 2;
+      const int d1 = d0 + 1;
+
+      rmtItems[g][pair].level0    = (animation[f][d0] >> bit) & 0x01;
+      rmtItems[g][pair].duration0 = stepTicks[d0];
+      rmtItems[g][pair].level1    = (animation[f][d1] >> bit) & 0x01;
+      rmtItems[g][pair].duration1 = stepTicks[d1];
     }
   }
 }
 
-static void writeRmtItemsAllChannels() {
-  for (int ch = 0; ch < 4; ++ch) {
-    // Explicitly stop each channel before handing it a new item list —
-    // the legacy RMT driver doesn't reliably pick up new items while a
-    // channel is still mid-loop from a previous write.
-    rmt_tx_stop(rmtChannels[ch]);
-    rmt_write_items(rmtChannels[ch], rmtItems[ch], N_DIVS / 2, false); // false = don't wait; loop runs in hardware
-  }
-}
-
-static void setupRmtChannel(int idx, int gpioNum) {
+static void setupRmtChannel(int index, int primaryGpio, int mirrorGpio) {
   rmt_config_t config = {};
   config.rmt_mode = RMT_MODE_TX;
-  config.channel = rmtChannels[idx];
-  config.gpio_num = (gpio_num_t)gpioNum;
+  config.channel = rmtChannels[index];
+  config.gpio_num = (gpio_num_t)primaryGpio;
   config.clk_div = RMT_CLK_DIV;
   config.mem_block_num = 1;
-  config.tx_config.loop_en = true;             // repeat the item list forever, in hardware
+  config.tx_config.loop_en = true;
   config.tx_config.carrier_en = false;
   config.tx_config.idle_output_en = true;
   config.tx_config.idle_level = RMT_IDLE_LEVEL_LOW;
-  config.tx_config.carrier_duty_percent = 50;  // unused, carrier disabled
-  config.tx_config.carrier_freq_hz = 38000;    // unused, carrier disabled
+  config.tx_config.carrier_duty_percent = 50;
+  config.tx_config.carrier_freq_hz = 38000;
   config.tx_config.carrier_level = RMT_CARRIER_LEVEL_HIGH;
 
-  ESP_ERROR_CHECK(rmt_config(&config));
-  ESP_ERROR_CHECK(rmt_driver_install(config.channel, 0, 0));
+  esp_err_t err = rmt_config(&config);
+  if (err != ESP_OK) {
+    Serial.printf("rmt_config channel %d GPIO %d failed: %s\n", index, primaryGpio, esp_err_to_name(err));
+    while (true) delay(1000);
+  }
+
+  err = rmt_driver_install(config.channel, 0, 0);
+  if (err != ESP_OK) {
+    Serial.printf("rmt_driver_install channel %d failed: %s\n", index, esp_err_to_name(err));
+    while (true) delay(1000);
+  }
+
+  // Mirror this RMT channel's own output signal onto the pair's second
+  // pin, inverted, directly at the GPIO matrix. This is the fix: both
+  // pins are now driven by the literal same hardware signal edge, just
+  // electrically inverted, so they cannot desync from each other.
+  gpio_set_direction((gpio_num_t)mirrorGpio, GPIO_MODE_OUTPUT);
+  gpio_matrix_out((gpio_num_t)mirrorGpio, RMT_SIG_OUT0_IDX + index, true /*invert*/, false);
 }
 
-// ---------------------------------------------------------------------
-// Button handling — runs at a relaxed, non-time-critical pace, since
-// the waveform itself is now entirely hardware-generated and no
-// longer depends on software timing at all.
-//
-// buttonPressed[i] is true when that button IS pressed (normal sense).
-// This differs from the original AVR code, which stored the raw PIND
-// bit (true = NOT pressed, since INPUT_PULLUP idles high) and then
-// used `!buttonPressed[i]` to test for an actual press. The logic
-// below is equivalent, just inverted to a more intuitive convention —
-// buttonPressed[i] here means exactly what its name says.
-// ---------------------------------------------------------------------
-static bool buttonPressed[N_BUTTONS];
-static bool anyButtonPressed;
-static unsigned long holdStartMs = 0;
-static bool holding = false;
+static void startWaveform() {
+  for (int ch = 0; ch < 2; ++ch) {
+    esp_err_t err = rmt_write_items(rmtChannels[ch], rmtItems[ch], N_DIVS / 2, false);
+    if (err != ESP_OK) {
+      Serial.printf("rmt_write_items channel %d failed: %s\n", ch, esp_err_to_name(err));
+      while (true) delay(1000);
+    }
+  }
+}
 
-static void pollButtonsAndUpdateFrame() {
+static void stopWaveform() {
+  for (int ch = 0; ch < 2; ++ch) {
+    esp_err_t err = rmt_tx_stop(rmtChannels[ch]);
+    if (err != ESP_OK) {
+      Serial.printf("rmt_tx_stop channel %d failed: %s\n", ch, esp_err_to_name(err));
+    }
+  }
+}
+
+static void setFrame(byte newFrame) {
+  if (newFrame == frame) return;
+  stopWaveform();
+  frame = newFrame;
+  buildRmtItemsForFrame(frame);
+  startWaveform();
+}
+
+static bool buttonPressed[N_BUTTONS];
+static bool anyButtonPressed = false;
+static bool holding = false;
+static uint32_t holdStartMs = 0;
+
+#define BLE_SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define BLE_RX_UUID             "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define BLE_TX_UUID             "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+static bool bleConnected = false;
+static NimBLEServer *pBleServer = nullptr;
+static NimBLECharacteristic *pTxCharacteristic = nullptr;
+static NimBLECharacteristic *pRxCharacteristic = nullptr;
+
+static void applyFrameDelta(int delta) {
+  int newFrame = (int)frame + delta;
+  while (newFrame < 0) newFrame += N_FRAMES;
+  while (newFrame >= (int)N_FRAMES) newFrame -= N_FRAMES;
+  setFrame((byte)newFrame);
+}
+
+static void sendBleStatus(const char *label) {
+  if (!bleConnected || pTxCharacteristic == nullptr) {
+    return;
+  }
+
+  char status[32];
+  snprintf(status, sizeof(status), "%s:%u\n", label, (unsigned)frame);
+  pTxCharacteristic->setValue(status);
+  pTxCharacteristic->notify();
+}
+
+// Only W (up) / S (down) / PageUp / PageDown / Esc (reset) remain —
+// A/D removed as requested. Both ASCII letters and raw HID usage codes
+// are accepted, in case the BLE client sends either.
+static void handleKeyCommand(uint8_t key) {
+  switch (key) {
+    case 'W':
+    case 'w':
+    case 0x4B: // HID PageUp
+      applyFrameDelta(+1);
+      sendBleStatus("phase");
+      break;
+
+    case 'S':
+    case 's':
+    case 0x4E: // HID PageDown
+      applyFrameDelta(-1);
+      sendBleStatus("phase");
+      break;
+
+    case 0x29: // HID Escape
+    case 0x1B: // ASCII ESC
+      setFrame(0);
+      sendBleStatus("reset");
+      break;
+
+    default:
+      break;
+  }
+}
+
+class TinyLevServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer *server, NimBLEConnInfo &connInfo) override {
+    bleConnected = true;
+    Serial.println("BLE connected");
+  }
+
+  void onDisconnect(NimBLEServer *server, NimBLEConnInfo &connInfo, int reason) override {
+    bleConnected = false;
+    Serial.printf("BLE disconnected, reason=%d\n", reason);
+  }
+};
+
+class TinyLevCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic *characteristic, NimBLEConnInfo &connInfo) override {
+    std::string value = characteristic->getValue();
+    if (value.empty()) {
+      return;
+    }
+
+    for (size_t i = 0; i < value.length(); ++i) {
+      uint8_t key = static_cast<uint8_t>(value[i]);
+      if (key == '\r' || key == '\n' || key == '\0') {
+        continue;
+      }
+      handleKeyCommand(key);
+    }
+  }
+};
+
+static void setupBle() {
+  NimBLEDevice::init("TinyLev");
+
+  pBleServer = NimBLEDevice::createServer();
+  pBleServer->setCallbacks(new TinyLevServerCallbacks());
+
+  NimBLEService *pService = pBleServer->createService(BLE_SERVICE_UUID);
+
+  pRxCharacteristic = pService->createCharacteristic(
+    BLE_RX_UUID,
+    NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY
+  );
+  pRxCharacteristic->setCallbacks(new TinyLevCharacteristicCallbacks());
+
+  pTxCharacteristic = pService->createCharacteristic(
+    BLE_TX_UUID,
+    NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ
+  );
+
+  pService->start();
+
+  NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(BLE_SERVICE_UUID);
+  pAdvertising->start();
+
+  Serial.println("BLE UART ready: TinyLev");
+}
+
+static void pollButtons() {
+  anyButtonPressed = false;
+
   for (uint8_t i = 0; i < N_BUTTONS; ++i) {
     buttonPressed[i] = (digitalRead(buttonPins[i]) == LOW);
-  }
-  anyButtonPressed = false;
-  for (uint8_t i = 0; i < N_BUTTONS; ++i) {
     if (buttonPressed[i]) anyButtonPressed = true;
   }
 
-  unsigned long now = millis();
-
-  if (anyButtonPressed) {
-    if (!holding) {
-      holding = true;
-      holdStartMs = now;
-    } else if (now - holdStartMs >= BUTTON_HOLD_MS) {
-      holdStartMs = now; // reset for auto-repeat while held
-
-      byte newFrame = frame;
-      if (buttonPressed[0]) {         // D2: previous frame
-        newFrame = (frame < STEP_SIZE) ? (N_FRAMES - 1) : (frame - STEP_SIZE);
-      } else if (buttonPressed[1]) {  // D3: next frame
-        newFrame = (frame >= N_FRAMES - STEP_SIZE) ? 0 : (frame + STEP_SIZE);
-      } else if (buttonPressed[2]) {  // D4: reset to frame 0
-        newFrame = 0;
-      }
-
-      if (newFrame != frame) {
-        frame = newFrame;
-        buildRmtItemsForFrame(frame);
-        writeRmtItemsAllChannels();
-#ifdef BUTTON_DEBUG
-        Serial.printf("frame changed -> %d\n", (int)frame);
-#endif
-      }
-    }
-  } else {
+  const uint32_t now = millis();
+  if (!anyButtonPressed) {
     holding = false;
+    return;
   }
+
+  if (!holding) {
+    holding = true;
+    holdStartMs = now;
+    return;
+  }
+
+  if ((uint32_t)(now - holdStartMs) < BUTTON_HOLD_MS) return;
+
+  holdStartMs = now;
+
+  if (buttonPressed[0]) {
+    const byte newFrame = (frame < STEP_SIZE) ? (N_FRAMES - 1) : (frame - STEP_SIZE);
+    setFrame(newFrame);
+  } else if (buttonPressed[1]) {
+    const byte newFrame = (frame >= N_FRAMES - STEP_SIZE) ? 0 : (frame + STEP_SIZE);
+    setFrame(newFrame);
+  } else if (buttonPressed[2]) {
+    setFrame(0);
+  }
+}
+
+static void printTiming(const int gpio[4]) {
+  Serial.println();
+  Serial.println("----------------------------------------");
+  Serial.println("TinyLev Nano ESP32 - Legacy RMT (hw-synced pairs)");
+  Serial.println("----------------------------------------");
+  Serial.printf("RMT clock:       %lu Hz\n", (unsigned long)RMT_TICK_HZ);
+  Serial.printf("Target frequency: %lu Hz\n", (unsigned long)SYNC_FREQ_HZ);
+  Serial.printf("Period:          %lu ticks = %.3f us\n", (unsigned long)PERIOD_TICKS, (double)PERIOD_TICKS * 1000000.0 / (double)RMT_TICK_HZ);
+  Serial.printf("Actual frequency: %.3f Hz\n", (double)RMT_TICK_HZ / (double)PERIOD_TICKS);
+  Serial.println();
+  Serial.println("Outputs (Arduino pin -> resolved GPIO):");
+  Serial.printf("  A0 -> GPIO%d = pair A primary (RMT ch0)\n", gpio[0]);
+  Serial.printf("  A1 -> GPIO%d = pair A mirror, hw-inverted\n", gpio[1]);
+  Serial.printf("  A2 -> GPIO%d = pair B primary (RMT ch1)\n", gpio[2]);
+  Serial.printf("  A3 -> GPIO%d = pair B mirror, hw-inverted\n", gpio[3]);
+  Serial.println();
+  Serial.println("Buttons: D2=previous  D3=next  D4=reset  D5-D7=unused");
+  Serial.println("BLE keys: W/PageUp=next  S/PageDown=previous  Esc=reset");
+  Serial.println("----------------------------------------");
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(200); // give the Serial Monitor time to connect
+  delay(200);
 
   for (uint8_t i = 0; i < N_BUTTONS; ++i) {
     pinMode(buttonPins[i], INPUT_PULLUP);
   }
 
-  computeStepDurations();
+  computeStepTicks();
 
-  // Resolve each Arduino pin macro (A0..A3) to its real GPIO number —
-  // needed on boards like the Nano ESP32, which remaps Arduino pin
-  // numbers away from raw GPIO numbers.
   int gpio[4] = {
     digitalPinToGPIONumber(OUT_PIN_0),
     digitalPinToGPIONumber(OUT_PIN_1),
     digitalPinToGPIONumber(OUT_PIN_2),
     digitalPinToGPIONumber(OUT_PIN_3)
   };
-  for (int i = 0; i < 4; ++i) {
-    setupRmtChannel(i, gpio[i]);
-  }
+
+  setupRmtChannel(0, gpio[0], gpio[1]); // pair A: primary + inverted mirror
+  setupRmtChannel(1, gpio[2], gpio[3]); // pair B: primary + inverted mirror
 
   buildRmtItemsForFrame(frame);
-  writeRmtItemsAllChannels();
-
-  Serial.printf(
-    "RMT waveform running: period=%lu ticks (%.3fus, %.1fHz)\n"
-    "step durations (ticks): ",
-    (unsigned long)PERIOD_TICKS,
-    (double)PERIOD_TICKS * 1000.0 / RMT_TICK_HZ * 1000.0,
-    (double)RMT_TICK_HZ / PERIOD_TICKS);
-  for (int d = 0; d < N_DIVS; ++d) Serial.printf("%lu ", (unsigned long)stepDuration[d]);
-  Serial.println();
+  startWaveform();
+  setupBle();
+  printTiming(gpio);
 }
 
 void loop() {
-  pollButtonsAndUpdateFrame();
-  delay(1); // ~1ms button poll rate — plenty fast for human button presses
+  pollButtons();
+  delay(1);
 }
