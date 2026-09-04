@@ -4,6 +4,9 @@
 #include "rom/gpio.h"          // gpio_matrix_out()
 #include "soc/gpio_sig_map.h"  // RMT_SIG_OUT0_IDX etc.
 #include <NimBLEDevice.h>      // NimBLE-Arduino 2.5.1 — single header covers server/service/characteristic
+#include <WiFi.h>
+#include <WebServer.h>         // built into the Arduino-ESP32 core — no extra library needed
+#include <ESPmDNS.h>           // also built into the core
 
 #define N_DIVS             24
 #define N_FRAMES           24
@@ -230,22 +233,24 @@ static void sendBleStatus(const char *label) {
   pTxCharacteristic->notify();
 }
 
-// Only W (up) / S (down) / PageUp / PageDown / Esc (reset) remain —
+// Only W (down) / S (up) / PageUp / PageDown / Esc (reset) remain —
 // A/D removed as requested. Both ASCII letters and raw HID usage codes
 // are accepted, in case the BLE client sends either.
+// NOTE: W/S directions were swapped from the original W=up/S=down —
+// W now decreases the frame, S now increases it.
 static void handleKeyCommand(uint8_t key) {
   switch (key) {
     case 'W':
     case 'w':
     case 0x4B: // HID PageUp
-      applyFrameDelta(+1);
+      applyFrameDelta(-1);
       sendBleStatus("phase");
       break;
 
     case 'S':
     case 's':
     case 0x4E: // HID PageDown
-      applyFrameDelta(-1);
+      applyFrameDelta(+1);
       sendBleStatus("phase");
       break;
 
@@ -291,6 +296,270 @@ class TinyLevCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
     }
   }
 };
+
+// ---------------------------------------------------------------------
+// WiFi + embedded web control page
+// ---------------------------------------------------------------------
+// The ESP32 joins your existing WiFi network (station mode) instead of
+// hosting its own — you keep normal internet access, and the device
+// registers itself on the network as "tinylev.local" via mDNS so you
+// don't need to hunt for its IP address.
+//
+// NOTE ON mDNS + WINDOWS: Windows' built-in mDNS resolution is
+// historically inconsistent without Apple's Bonjour service installed
+// (a longstanding Windows quirk, not something fixable in this code).
+// If http://tinylev.local doesn't resolve on your laptop, check the
+// Serial Monitor at boot for the raw IP address and use that directly
+// instead — it's printed as a guaranteed-working fallback either way.
+#define WIFI_STA_SSID     "Acoustofab Office"     // <-- fill in your network name
+#define WIFI_STA_PASSWORD "AcoustofaX4M8" // <-- fill in your network password
+#define WIFI_CONNECT_TIMEOUT_MS 15000
+#define MDNS_HOSTNAME "tinylev" // reachable at http://tinylev.local
+
+static WebServer webServer(80);
+
+// The page has two views, toggled client-side with no page reload:
+//   #landing  — checks /status to actively confirm the device is
+//               reachable, then shows a "Found TinyLev — Connect?"
+//               button rather than jumping straight to controls.
+//   #controls — same instrument-style control panel as before, now
+//               with press-and-hold auto-repeat on W/S (both the
+//               physical key and the on-screen button), matching how
+//               holding the device's own physical buttons behaves.
+static const char CONTROL_PAGE[] PROGMEM = R"HTMLPAGE(<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TinyLev — WiFi Control</title>
+<style>
+  :root { --bg:#0b0f0d; --panel:#101613; --line:#22302a; --phos:#4fe38a; --phosd:#2c7a52; --amber:#e8a13a; --text:#d7e4dc; --dim:#6d8377; }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; background:var(--bg); color:var(--text); font-family:-apple-system,"Segoe UI",sans-serif;
+         display:flex; align-items:center; justify-content:center; padding:24px; }
+  .box { width:100%; max-width:420px; background:var(--panel); border:1px solid var(--line); border-radius:4px; }
+  .hd { padding:16px 20px; border-bottom:1px solid var(--line); font-family:monospace; font-size:13px; }
+  .hd span { color:var(--phos); }
+  .rd { margin:18px 20px; padding:14px 16px; background:#070a08; border:1px solid var(--line); border-radius:3px; font-family:monospace; font-size:13px; }
+  .rd div { display:flex; justify-content:space-between; padding:4px 0; }
+  .rd .l { color:var(--dim); font-size:11px; }
+  .rd .v { color:var(--phos); }
+  .keys { padding:0 20px 20px; display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .k { border:1px solid var(--line); border-radius:3px; padding:16px 12px; text-align:center; cursor:pointer; user-select:none; background:transparent; color:var(--text); transition:border-color .08s,background .08s; }
+  .k:active, .k.hit { border-color:var(--phos); background:rgba(79,227,138,.1); }
+  .k.r { grid-column:span 2; }
+  .k b { font-size:13px; display:block; }
+  .k small { font-family:monospace; font-size:10px; color:var(--dim); }
+  .fn { padding:14px 20px 18px; border-top:1px solid var(--line); font-size:11px; color:var(--dim); line-height:1.5; }
+  .land { padding:34px 24px; text-align:center; }
+  .land .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:8px; background:var(--dim); }
+  .land .dot.ok { background:var(--phos); box-shadow:0 0 8px var(--phos); }
+  .land .dot.searching { background:var(--amber); animation:pulse 1s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:.3;} }
+  .land p { font-family:monospace; font-size:13px; margin:14px 0 22px; }
+  .land button { padding:12px 22px; background:transparent; border:1px solid var(--phosd); color:var(--phos);
+                 font-family:monospace; font-size:13px; border-radius:3px; cursor:pointer; }
+  .land button:hover { border-color:var(--phos); background:rgba(79,227,138,.08); }
+  .land button:disabled { opacity:.4; cursor:default; }
+  .hidden { display:none; }
+</style></head>
+<body>
+
+<div class="box" id="landing">
+  <div class="hd">TINYLEV <span>CONTROL</span> &middot; WiFi</div>
+  <div class="land">
+    <div><span class="dot searching" id="landDot"></span><span id="landText">Searching for TinyLev&hellip;</span></div>
+    <p id="landSub">Checking the device is reachable on this network.</p>
+    <button id="landBtn" disabled>Connect</button>
+  </div>
+</div>
+
+<div class="box hidden" id="controls">
+  <div class="hd">TINYLEV <span>CONTROL</span> &middot; WiFi</div>
+  <div class="rd">
+    <div><span class="l">FRAME</span><span class="v" id="frame">&mdash;</span></div>
+  </div>
+  <div class="keys">
+    <div class="k" id="up"><b>Phase up</b><small>S / Page Down &middot; hold to repeat</small></div>
+    <div class="k" id="down"><b>Phase down</b><small>W / Page Up &middot; hold to repeat</small></div>
+    <div class="k r" id="reset"><b>Reset to frame 0</b><small>Esc</small></div>
+  </div>
+  <div class="fn">Keyboard works once you've clicked anywhere on this page. Hold S/W (key or button) to repeat; buttons also work by tap/click.</div>
+</div>
+
+<script>
+  const landing = document.getElementById('landing'), controls = document.getElementById('controls');
+  const landDot = document.getElementById('landDot'), landText = document.getElementById('landText'),
+        landSub = document.getElementById('landSub'), landBtn = document.getElementById('landBtn');
+
+  const upEl = document.getElementById('up'), downEl = document.getElementById('down'),
+        resetEl = document.getElementById('reset'), frameEl = document.getElementById('frame');
+
+  // --- Discovery / landing screen ---
+  async function probe() {
+    try {
+      const res = await fetch('/status', { cache: 'no-store' });
+      if (!res.ok) throw new Error('bad status');
+      const frameNow = await res.text();
+      landDot.className = 'dot ok';
+      landText.textContent = 'TinyLev found';
+      landSub.textContent = 'Currently on frame ' + frameNow + '.';
+      landBtn.disabled = false;
+      return true;
+    } catch (e) {
+      landDot.className = 'dot searching';
+      landText.textContent = 'Searching for TinyLev\u2026';
+      landSub.textContent = 'Make sure you\u2019re on the same network as the device.';
+      landBtn.disabled = true;
+      return false;
+    }
+  }
+
+  probe();
+  const probeInterval = setInterval(probe, 2000);
+
+  landBtn.addEventListener('click', () => {
+    clearInterval(probeInterval);
+    landing.classList.add('hidden');
+    controls.classList.remove('hidden');
+    poll();
+  });
+
+  // --- Controls screen ---
+  function flash(el){ el.classList.add('hit'); setTimeout(()=>el.classList.remove('hit'),120); }
+
+  async function send(key, el){
+    try {
+      const res = await fetch('/cmd?key=' + encodeURIComponent(key));
+      const txt = await res.text();
+      frameEl.textContent = txt;
+    } catch(e) { console.error(e); }
+    if (el) flash(el);
+  }
+
+  const sendUp    = () => send('s', upEl);
+  const sendDown  = () => send('w', downEl);
+  const sendReset = () => send('\x1b', resetEl);
+
+  // Press-and-hold auto-repeat, shared by keyboard and on-screen
+  // buttons. Fires once immediately, then repeats every REPEAT_MS
+  // while held, mirroring the device's own physical-button hold
+  // behaviour.
+  const REPEAT_MS = 140;
+  let repeatTimer = null;
+  let repeatAction = null;
+
+  function startRepeat(action) {
+    if (repeatTimer !== null && repeatAction === action) return; // already repeating this one
+    stopRepeat();
+    repeatAction = action;
+    action(); // fire immediately on press
+    repeatTimer = setInterval(action, REPEAT_MS);
+  }
+
+  function stopRepeat() {
+    if (repeatTimer !== null) { clearInterval(repeatTimer); repeatTimer = null; }
+    repeatAction = null;
+  }
+
+  // On-screen buttons: mouse + touch
+  function bindHold(el, action) {
+    el.addEventListener('mousedown', () => startRepeat(action));
+    el.addEventListener('touchstart', (e) => { e.preventDefault(); startRepeat(action); }, { passive:false });
+    ['mouseup','mouseleave','touchend','touchcancel'].forEach(ev =>
+      el.addEventListener(ev, stopRepeat));
+  }
+  bindHold(upEl, sendUp);
+  bindHold(downEl, sendDown);
+  resetEl.addEventListener('click', sendReset); // reset is a single action, no hold-repeat
+
+  // Keyboard: hold-repeat for W/S (and their paired Page keys), single-shot for Esc.
+  // W/PageUp and S/PageDown move together as pairs, matching the firmware's
+  // grouping — holding either key in a pair repeats the same action.
+  window.addEventListener('keydown', (e) => {
+    if (e.repeat) return; // browser's own OS-level key-repeat — we handle repeat ourselves
+    switch (e.key) {
+      case 's': case 'S': case 'PageDown': e.preventDefault(); startRepeat(sendUp);   break;
+      case 'w': case 'W': case 'PageUp':   e.preventDefault(); startRepeat(sendDown); break;
+      case 'Escape':                        e.preventDefault(); sendReset();          break;
+    }
+  });
+  window.addEventListener('keyup', (e) => {
+    switch (e.key) {
+      case 'w': case 'W': case 'PageUp':
+      case 's': case 'S': case 'PageDown':
+        stopRepeat();
+        break;
+    }
+  });
+  window.addEventListener('blur', stopRepeat); // stop repeating if window loses focus mid-hold
+
+  async function poll(){
+    try {
+      const res = await fetch('/status');
+      frameEl.textContent = await res.text();
+    } catch(e) {}
+  }
+  setInterval(poll, 1000);
+</script>
+</body></html>
+)HTMLPAGE";
+
+static void handleRoot() {
+  webServer.send_P(200, "text/html", CONTROL_PAGE);
+}
+
+static void handleCmd() {
+  if (webServer.hasArg("key")) {
+    String k = webServer.arg("key");
+    if (k.length() > 0) {
+      handleKeyCommand((uint8_t)k[0]);
+    }
+  }
+  webServer.send(200, "text/plain", String(frame));
+}
+
+static void handleStatus() {
+  webServer.send(200, "text/plain", String(frame));
+}
+
+static void setupWifi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASSWORD);
+
+  Serial.print("Connecting to WiFi");
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < WIFI_CONNECT_TIMEOUT_MS) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi FAILED to connect within timeout — check WIFI_STA_SSID/PASSWORD "
+                    "at the top of the file. Web control will be unavailable; BLE still works.");
+    return;
+  }
+
+  bool mdnsOk = MDNS.begin(MDNS_HOSTNAME);
+
+  webServer.on("/", handleRoot);
+  webServer.on("/cmd", handleCmd);
+  webServer.on("/status", handleStatus);
+  webServer.begin();
+  if (mdnsOk) MDNS.addService("http", "tcp", 80);
+
+  Serial.println();
+  Serial.println("----------------------------------------");
+  Serial.printf("WiFi joined: %s\n", WIFI_STA_SSID);
+  Serial.print("Control page (IP, always works):      http://");
+  Serial.println(WiFi.localIP());
+  if (mdnsOk) {
+    Serial.printf("Control page (mDNS, if it resolves):  http://%s.local\n", MDNS_HOSTNAME);
+  } else {
+    Serial.println("mDNS failed to start — use the IP address above instead.");
+  }
+  Serial.println("----------------------------------------");
+}
+
 
 static void setupBle() {
   NimBLEDevice::init("TinyLev");
@@ -376,25 +645,6 @@ static void printTiming(const int gpio[4]) {
   Serial.printf("Period:          %lu ticks = %.3f us\n", (unsigned long)PERIOD_TICKS, (double)PERIOD_TICKS * 1000000.0 / (double)RMT_TICK_HZ);
   Serial.printf("Actual frequency: %.3f Hz\n", (double)RMT_TICK_HZ / (double)PERIOD_TICKS);
   Serial.println();
-NEW SKETCH
-377378379380381382383384385386387388389390391392393394395396397398399400401402403404405406407408409410411412413414415416
-  startWaveform();
-  setupBle();
-NEW SKETCH
-
-  printTiming(gpio);
-}
-
-void loop() {
-NEW SKETCH
-
-  pollButtons();
-  delay(1);
-}
-
-Not connected. Select a board and a port to connect automatically.
-New Line
-
   Serial.println("Outputs (Arduino pin -> resolved GPIO):");
   Serial.printf("  A0 -> GPIO%d = pair A primary (RMT ch0)\n", gpio[0]);
   Serial.printf("  A1 -> GPIO%d = pair A mirror, hw-inverted\n", gpio[1]);
@@ -402,7 +652,7 @@ New Line
   Serial.printf("  A3 -> GPIO%d = pair B mirror, hw-inverted\n", gpio[3]);
   Serial.println();
   Serial.println("Buttons: D2=previous  D3=next  D4=reset  D5-D7=unused");
-  Serial.println("BLE keys: W/PageUp=next  S/PageDown=previous  Esc=reset");
+  Serial.println("BLE keys: S/PageDown=next  W/PageUp=previous  Esc=reset");
   Serial.println("----------------------------------------");
 }
 
@@ -429,10 +679,12 @@ void setup() {
   buildRmtItemsForFrame(frame);
   startWaveform();
   setupBle();
+  setupWifi();
   printTiming(gpio);
 }
 
 void loop() {
   pollButtons();
+  webServer.handleClient();
   delay(1);
 }
